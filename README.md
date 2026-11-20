@@ -67,7 +67,14 @@ and the final phase allows one scored run).
    `wave`), a second set of donors is drawn from the other round only: the file holds one
    row per household per round, so a household interviewed in both rounds would have its
    other interview there, and a same-round lookalike with an identical profile must not
-   outvote it. (`USE_DONORS` at the top of `main.py` turns donors off.)
+   outvote it. A third set links the two rounds by probabilistic record linkage (Fellegi
+   and Sunter, 1969): EM learns how often each GIVEN column agrees between a household's two
+   interviews and between other pairs, with at most one partner per row, and donors vote
+   with their posterior probability of being the same household. It is fitted twice, once
+   as is and once with the columns whose question is about the person answering ("your
+   age", "the respondent's relationship") counted as weak evidence, because another member
+   of the household may answer the second interview. (`USE_DONORS` at the top of `main.py`
+   turns donors off.)
 6. **Floor-aware reporting.** The grader mixes every vector with a flat one before scoring,
    so reporting the belief itself is not optimal. Maximising the expected score of the
    floored vector gives a water-filling transform, used per item whenever it scores better
@@ -98,8 +105,10 @@ score can be read against the best possible score rather than against another gu
   probability 0.7. A near-duplicate version (`PANEL_COPY=0.95 PANEL_FLIP=0.02
   PANEL_LOOK=0.3`) carries 95% of answers over and gives 30% of first-round households
   the exact profile of another household, because identical profiles are common in real
-  survey data and rare in the sandbox. There is no exact oracle; it measures whether a
-  method uses near-identical donors when they exist.
+  survey data and rare in the sandbox. Adding `PANEL_RESP=0.5` has half of the
+  re-interviews answered by a different member, whose own four columns then differ. There
+  is no exact oracle; it measures whether a method uses near-identical donors when they
+  exist.
 
 The worlds pull in different directions. A shared neural trunk is the best single model in
 the first and the worst in the second; lookup tables are the reverse; donors dominate the
@@ -115,7 +124,7 @@ code. Seed 1 unless stated. Standard errors are 0.002 to 0.010.
 
 | | UNHCR | World Bank | UNICEF | mean |
 |---|---|---|---|---|
-| this method, seed 1 | 0.2734 | 0.2767 | 0.3988 | 0.3163 |
+| this method, seed 1 | 0.2732 | 0.2767 | 0.3988 | 0.3162 |
 | best possible, seed 1 | 0.2766 | 0.2803 | 0.4000 | 0.3190 |
 | this method, seed 2 | 0.2706 | 0.2962 | 0.3491 | 0.3053 |
 | best possible, seed 2 | 0.2737 | 0.2997 | 0.3494 | 0.3076 |
@@ -129,27 +138,31 @@ code. Seed 1 unless stated. Standard errors are 0.002 to 0.010.
 | logistic regression only | 0.2314 | 0.3083 | 0.5284 |
 | lookup tables only | 0.2560 | 0.3119 | 0.5270 |
 | the stack before this test (no two-part outputs) | 0.2646 | 0.3212 | 0.5295 |
-| **this method** | **0.2718** | **0.3253** | **0.5296** |
+| **this method** | **0.2717** | **0.3253** | **0.5296** |
 | best possible | 0.2832 | 0.3338 | 0.5303 |
 
 **The two-round panel** (no exact ceiling):
 
-| system | UNHCR | UNHCR, harder twins | UNHCR, near-duplicates | World Bank |
-|---|---|---|---|---|
-| lookup tables only | 0.2025 | | | |
-| the stack without donors | 0.2885 | | | 0.2460 |
-| donors from either round | 0.3571 | 0.2916 | 0.3345 | 0.3094 |
-| **this method** (donors from the other round added) | **0.3685** | **0.3025** | **0.3813** | **0.3094** |
+| system | UNHCR | harder twins | near-duplicates | another member answers | World Bank |
+|---|---|---|---|---|---|
+| lookup tables only | 0.2025 | | | | |
+| the stack without donors | 0.2885 | | | | 0.2460 |
+| donors from either round | 0.3571 | 0.2916 | 0.3345 | | 0.3094 |
+| plus donors from the other round | 0.3685 | 0.3025 | 0.3813 | 0.2998 | 0.3094 |
+| **this method** (plus record linkage) | **0.3721** | **0.3025** | **0.3824** | **0.3544** | **0.3094** |
 
 On the stress test the two-part outputs halve the gap on items behind skip logic, and the
 UNHCR score moves from 93% to 96% of the best possible. On the panel, donors add about 0.08
 on UNHCR and 0.06 on the World Bank. Drawing donors from the other round matters most when
 same-round households share a profile: in the near-duplicate world a same-round lookalike
-otherwise outvotes the household's own other interview. Where there are no twins (the
-sandbox and the stress test) the donor layer switches itself off and the scores do not move.
+otherwise outvotes the household's own other interview. Record linkage matters most when
+another member answers the second interview, which moves the twin out of reach of a plain
+distance cut-off. Where there are no twins (the sandbox and the stress test) the donor
+layer switches itself off and the scores do not move. The World Bank and UNICEF files have
+no round column, so the last two rows do not change anything there.
 
-**Cost.** All three instruments in one process, as hosted: 18 minutes on an L4 GPU (the
-limit is 60 minutes on an H100), peak memory 5.0 GB (limit 16 GB).
+**Cost.** All three instruments in one process, as hosted: 19 minutes on an L4 GPU (the
+limit is 60 minutes on an H100), peak memory 5.1 GB (limit 16 GB).
 
 ## Reproducing
 
@@ -162,6 +175,7 @@ limit is 60 minutes on an H100), peak memory 5.0 GB (limit 16 GB).
     STRESS_MODE=panel python stress.py . unhcr 1                 # the two-round panel
     STRESS_MODE=panel PANEL_FLIP=0.2 python stress.py . unhcr 1  # harder twins
     STRESS_MODE=panel PANEL_COPY=0.95 PANEL_FLIP=0.02 PANEL_LOOK=0.3 python stress.py . unhcr 1  # near-duplicates
+    STRESS_MODE=panel PANEL_COPY=0.95 PANEL_FLIP=0.02 PANEL_LOOK=0.3 PANEL_RESP=0.5 python stress.py . unhcr 1  # another member answers
     ORACLE_SEED=1 python harness.py oracle unhcr 2 1   # the sandbox ceiling
     python robust.py .                    # adversarial inputs, every output checked legal
 

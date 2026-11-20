@@ -131,7 +131,7 @@ def stress_frame(schema, config, seed, soft):
     return frame.astype(object), dist, kinds
 
 
-def panel_frame(schema, config, seed, frac=0.4, copy_p=0.7, flip=0.05, lookalike=0.0):
+def panel_frame(schema, config, seed, frac=0.4, copy_p=0.7, flip=0.05, lookalike=0.0, respondent=0.0):
     """The official sandbox, turned into a two-round panel: a share of rows are
     second-round re-interviews of other households. Each copies its household's
     GIVEN block (round set to 2, each column changed with probability `flip`)
@@ -139,8 +139,10 @@ def panel_frame(schema, config, seed, frac=0.4, copy_p=0.7, flip=0.05, lookalike
     fresh answer of its own. With `lookalike` > 0, that share of first-round
     households first takes the GIVEN block of another first-round household
     (keeping its own answers), so identical same-round profiles are common, as
-    they are in real data. There is no exact oracle here; it measures whether
-    a method can use near-identical donors when they exist."""
+    they are in real data. With `respondent` > 0, that share of re-interviews
+    is answered by a different household member, whose own columns (relation,
+    age, education, marital status) differ. There is no exact oracle here; it
+    measures whether a method can use near-identical donors when they exist."""
     base = make_sandbox(schema, config, seed=seed)
     rng = np.random.default_rng([seed, 9191])
     recs = schema["items"]
@@ -171,12 +173,25 @@ def panel_frame(schema, config, seed, frac=0.4, copy_p=0.7, flip=0.05, lookalike
         w = np.full(n, "1", dtype=object)
         w[second] = "2"
         out["wave"] = w
+    if respondent > 0:  # a different member answers: their own columns change together
+        rng3 = np.random.default_rng([seed, 5151])
+        other = second[rng3.random(len(second)) < respondent]
+        donor = rng3.choice(pool, size=len(other), replace=True)
+        for g in [g for g in RESPONDENT_COLUMNS if g in given]:
+            col = out[g].to_numpy(dtype=object).copy()
+            col[other] = col[donor]
+            out[g] = col
     for t in pred:
         col = out[t].to_numpy(dtype=object).copy()
         cp = rng.random(len(second)) < copy_p
         col[second[cp]] = col[src[cp]]
         out[t] = col
     return out.astype(object), None, {t: "P" for t in pred}
+
+
+# UNHCR's columns that describe the person answering rather than the household
+RESPONDENT_COLUMNS = ("s2_1_hh_relationship_lbl", "s2_1b_age", "s2_1c_education_level_lbl",
+                      "s2_1d_marital_status_lbl")
 
 
 def main():
@@ -189,7 +204,8 @@ def main():
         frame_all, dist, kinds = panel_frame(schema, config, seed,
                                              copy_p=float(os.environ.get("PANEL_COPY", "0.7")),
                                              flip=float(os.environ.get("PANEL_FLIP", "0.05")),
-                                             lookalike=float(os.environ.get("PANEL_LOOK", "0")))
+                                             lookalike=float(os.environ.get("PANEL_LOOK", "0")),
+                                             respondent=float(os.environ.get("PANEL_RESP", "0")))
         assert sub != "oracle", "the panel world has no exact oracle"
     else:
         frame_all, dist, kinds = stress_frame(schema, config, seed, soft=(inst == "unhcr"))
@@ -237,8 +253,8 @@ def main():
     print("KINDS", dict(Counter(kinds.values())))
     mode = os.environ.get("STRESS_MODE", "stress")
     if mode == "panel":
-        mode += "(copy %s flip %s look %s)" % (os.environ.get("PANEL_COPY", "0.7"), os.environ.get("PANEL_FLIP", "0.05"),
-                                               os.environ.get("PANEL_LOOK", "0"))
+        mode += "(copy %s flip %s look %s resp %s)" % (os.environ.get("PANEL_COPY", "0.7"), os.environ.get("PANEL_FLIP", "0.05"),
+                                                       os.environ.get("PANEL_LOOK", "0"), os.environ.get("PANEL_RESP", "0"))
     if os.environ.get("SB_DONORS") == "0":
         mode += " donors-off"
     print(("RESULT %-10s %-28s " + mode + " seed %d  skill %.4f  (log %.4f, ref %.4f, se %.4f)  predict %.1fs  cells %d")

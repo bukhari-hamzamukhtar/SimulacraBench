@@ -12,7 +12,8 @@ logistic models, multitask and per-item neural networks, and nearest-neighbour h
 donors, mixed per item by EM on out-of-fold predictions, then calibrated and adjusted for
 the grader's probability floor. Two components are specific to survey data: a two-part
 ("hurdle") output for skip-logic items, and a hot-deck donor correction for respondents with
-near-identical profiles. Because the real data are never released, we measure the method in
+near-identical profiles, which on a two-round file also links the rounds by probabilistic
+record linkage. Because the real data are never released, we measure the method in
 three synthetic worlds that each come with an exact or strong reference: the official
 sandbox (where we reach 99% of the Bayes-optimal score), a structured stress test with an
 exact oracle, and a two-round panel. No single model family wins in all three; the stack
@@ -67,8 +68,13 @@ the GIVEN block has a survey-round column, a second set of donors is drawn from 
 round only. The UNHCR file holds one row per household per round, so a household
 interviewed twice would have its other interview in the other round, while a same-round
 lookalike with an identical profile is a different household and must not outvote it.
-In our harder panel world a cut-off of 2 alone recovers almost none of the gain that a
-cut-off of 4 does.
+A third set links the rounds by probabilistic record linkage (Fellegi and Sunter, 1969):
+EM learns how often each column agrees between a household's two interviews and between
+other pairs, allowing at most one partner per row, and donors vote with their posterior
+probability of being the same household. It is fitted a second time with the columns
+whose question is about the person answering ("your age", "the respondent's
+relationship") held at weak evidence, since another member may answer the second
+interview; a twin five columns away is then still found.
 
 **Floor-aware reporting.** The grader mixes every vector with a flat one, so reporting the
 belief itself is not optimal. Maximising the expected floored score gives a water-filling
@@ -76,8 +82,8 @@ transform, p_k = max(eps, c b_k), used per item when it scores better OOF.
 
 **Budget.** A wall-clock governor gives each instrument a share of 45 minutes, carries
 unused time forward, drops candidates whose projected cost does not fit, and lets any
-candidate fail without failing the run. The full three-instrument run takes 18 minutes on an
-L4 GPU (limit: 60 minutes on an H100), peak memory 5.0 GB (limit 16 GB).
+candidate fail without failing the run. The full three-instrument run takes 19 minutes on an
+L4 GPU (limit: 60 minutes on an H100), peak memory 5.1 GB (limit 16 GB).
 
 ## 3. Evaluation without the real data
 
@@ -100,23 +106,26 @@ follow-up contact and an "interviewed before" question, so round 2 likely re-con
 round-1 households. A near-duplicate version carries 95% of
 answers over and gives 30% of first-round households the exact profile of another
 household, since identical profiles are common in real survey data and rare in the
-sandbox.
+sandbox. A further version has half of the re-interviews answered by a different member,
+whose own four columns then differ.
 
 | world | system | UNHCR | World Bank | UNICEF |
 |---|---|---|---|---|
-| sandbox | ours | 0.2734 | 0.2767 | 0.3988 |
+| sandbox | ours | 0.2732 | 0.2767 | 0.3988 |
 | sandbox | best possible | 0.2766 | 0.2803 | 0.4000 |
 | stress | organisers' baseline | 0.2012 | 0.2977 | 0.5217 |
 | stress | shared network only | 0.1952 | 0.2924 | 0.5272 |
 | stress | logistic only | 0.2314 | 0.3083 | 0.5284 |
 | stress | lookup tables only | 0.2560 | 0.3119 | 0.5270 |
-| stress | ours | 0.2718 | 0.3253 | 0.5296 |
+| stress | ours | 0.2717 | 0.3253 | 0.5296 |
 | stress | best possible | 0.2832 | 0.3338 | 0.5303 |
 | panel | ours without donors | 0.2885 | 0.2460 | |
-| panel | ours, without other-round donors | 0.3571 | 0.3094 | |
-| panel | ours | 0.3685 | 0.3094 | |
-| near-duplicate panel | ours, without other-round donors | 0.3345 | | |
-| near-duplicate panel | ours | 0.3813 | | |
+| panel | donors from either round | 0.3571 | 0.3094 | |
+| panel | ours | 0.3721 | 0.3094 | |
+| near-duplicate panel | donors from either round | 0.3345 | | |
+| near-duplicate panel | ours | 0.3824 | | |
+| near-duplicate, another member answers | without record linkage | 0.2998 | | |
+| near-duplicate, another member answers | ours | 0.3544 | | |
 
 *Skill on held-out cells, seed 1, scored by the grader's own code; standard errors 0.002 to
 0.010. On a second sandbox seed we score 0.2706 / 0.2962 / 0.3491 against a best possible
@@ -149,3 +158,5 @@ once ordering effects are removed, and the visible rows carry far more informati
   (hot-deck imputation).
 - J. G. Cragg. Some statistical models for limited dependent variables with application to
   the demand for durable goods. *Econometrica* 39(5), 1971 (two-part / hurdle models).
+- I. P. Fellegi, A. B. Sunter. A theory for record linkage. *Journal of the American
+  Statistical Association* 64(328), 1969.

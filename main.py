@@ -24,7 +24,10 @@ models on the data it is handed:
      off where it does not help. When the GIVEN block has a survey-round column,
      a second set of donors comes from the other round only: a household
      interviewed in both rounds has its other interview there, and a same-round
-     lookalike must not outvote it;
+     lookalike must not outvote it. A third set links the rounds by
+     probabilistic record linkage (Fellegi and Sunter, 1969), which learns how
+     often each column agrees within a household, so a twin answered by a
+     different member is still found;
   5. the grader mixes every vector with a flat one before scoring, so reporting
      the belief directly is not optimal. We report the exact optimum (a
      water-filling transform) whenever it scores better OOF.
@@ -114,6 +117,16 @@ def _numeric_value(v):
     return float(m.group(1))
 
 
+def _about_respondent(question):
+    """True for a GIVEN question about the person answering ("your age", "the
+    respondent's relationship") rather than the household or a place. Another
+    member of the same household can answer these differently."""
+    q = str(question)
+    if re.search(r"\brespondent", q, re.I):
+        return True
+    return bool(re.search(r"\b(you|your|yourself)\b", q, re.I)) and not re.search(r"\bhousehold", q, re.I)
+
+
 class Instrument:
     """Everything predict() needs, encoded once."""
 
@@ -121,6 +134,8 @@ class Instrument:
         items = schema["items"]
         names = [n for n, r in items.items() if r["class"] in ("GIVEN", "PREDICT")]
         self.given = [n for n in names if items[n]["class"] == "GIVEN"]
+        # GIVEN columns that describe the person answering rather than the household
+        self.resp_cols = [c for c, g in enumerate(self.given) if _about_respondent(items[g].get("question") or "")]
         self.targets = [n for n in names if items[n]["class"] == "PREDICT"]
         gated_value = schema.get("gated_value", "NA_GATED")
         self.options, self.gated = [], []
@@ -1152,7 +1167,134 @@ def _donor_votes(inst, configs=DONOR_CONFIGS, k=64):
         for li in range(n_cfg):
             oof_cnt[li][va], oof_tot[li][va] = c[li], t[li]
     hid_cnt, hid_tot = votes(inst.Xh, np.arange(n))
+    if rc is not None:
+        # record linkage between the rounds; on any failure only this part is lost
+        resp = [c for c in inst.resp_cols if c != rc]
+        for weak in [[]] + ([resp] if resp else []):
+            if True:
+                try:
+                    t0 = time.time()
+                    lc, lt, hc, ht, info = _link_votes(inst, rc, fold, slot_all, valid_all, weak)
+                    oof_cnt += lc
+                    oof_tot += lt
+                    hid_cnt += hc
+                    hid_tot += ht
+                    log("  record linkage %5.1fs   %s" % (time.time() - t0, info))
+                except Exception as exc:
+                    log("  record linkage skipped (%s: %s)" % (type(exc).__name__, str(exc)[:120]))
     return oof_cnt, oof_tot, hid_cnt, hid_tot
+
+
+LINK_K = 16          # other-round candidates per row, for fitting and for voting
+LINK_WEAK_RHO = 0.5  # chance that a household's other interview has a different respondent
+
+
+def _link_votes(inst, rc, fold, slot_all, valid_all, weak=()):
+    """Probabilistic record linkage between the two survey rounds (Fellegi and
+    Sunter, 1969). Each row has at most one true partner in the other round (its
+    household's other interview). On the true pair GIVEN column c agrees with
+    probability m_c; on any other candidate pair with probability u_c. Both are
+    fitted by EM on each row's nearest other-round rows, with a posterior over
+    "none of them" and each candidate, so a column that often changes between a
+    household's two interviews (who answered, for instance) is learned to count
+    for little and a twin several columns away can still be found. Donors vote
+    with their posterior probability of being the same household, which sums to
+    at most one per row."""
+    dev = DEVICE
+    n = len(inst.vis)
+    cols = [c for c in range(len(inst.given)) if c != rc]     # derived columns would double-count
+    cards = inst.cards[cols]
+    off = np.concatenate([[0], np.cumsum(cards)[:-1]]).astype(np.int64)
+    n_oh = int(cards.sum())
+    C = len(cols)
+    Xv, Xh = inst.Xv[:, cols], inst.Xh[:, cols]
+
+    def onehot(X):
+        H = torch.zeros((len(X), n_oh), device=dev)
+        H.scatter_(1, torch.as_tensor(X + off[None, :], device=dev), 1.0)
+        return H
+
+    Hv = onehot(Xv)
+    rv = torch.as_tensor(inst.Xv[:, rc], device=dev)
+    rh = torch.as_tensor(inst.Xh[:, rc], device=dev)
+    kk = int(min(LINK_K, n - 1))
+    Xv_t = torch.as_tensor(Xv, device=dev)
+
+    # ---- EM on each visible row's nearest other-round visible rows ----------
+    cand = []
+    for a in range(0, n, 2048):
+        b = min(a + 2048, n)
+        dist = C - Hv[a:b] @ Hv.T + 1000.0 * (rv[a:b, None] == rv[None, :]).float()
+        cand.append(torch.topk(-dist, kk, dim=1)[1])
+    cand = torch.cat(cand)                                        # n x k
+    other = (rv[cand] != rv[:, None]).float()                     # really from the other round
+    if float(other.sum()) < 50:
+        raise ValueError("too few cross-round pairs")
+    agree = (Xv_t[:, None, :] == Xv_t[cand]).float()              # n x k x C
+    wk = [cols.index(c) for c in weak if c in cols]
+    weak_t = None
+    if wk:
+        weak_t = torch.zeros(C, dtype=torch.bool, device=dev)
+        weak_t[wk] = True
+    m = torch.full((C,), float(os.environ.get("SB_LINK_M0", "0.95")), device=dev)
+    u = ((agree * other[:, :, None]).sum((0, 1)) / other.sum()).clamp(0.01, 0.99)
+    q = torch.tensor(0.3, device=dev)
+    for _ in range(int(os.environ.get("SB_LINK_IT", "60"))):
+        llr = (agree * (torch.log(m) - torch.log(u))
+               + (1 - agree) * (torch.log1p(-m) - torch.log1p(-u))).sum(2)
+        llr = llr.masked_fill(other == 0, -1e4)
+        z = torch.cat([torch.log1p(-q).expand(n, 1), torch.log(q / kk) + llr], dim=1)
+        post = torch.softmax(z, dim=1)[:, 1:]                     # P(candidate is the partner)
+        m = ((post[:, :, None] * agree).sum((0, 1)) / post.sum().clamp_min(1e-9)).clamp(0.02, 0.998)
+        if weak_t is not None:   # the respondent may differ: their columns stay weak evidence
+            m = torch.where(weak_t, 1 - LINK_WEAK_RHO * (1 - u), m)
+        rest = (1 - post) * other
+        u = ((rest[:, :, None] * agree).sum((0, 1)) / rest.sum().clamp_min(1e-9)).clamp(0.005, 0.995)
+        q = post.sum(1).mean().clamp(1e-3, 0.999)
+    col_of = torch.as_tensor(np.repeat(np.arange(C), cards), device=dev)
+    w_dis = torch.log1p(-m) - torch.log1p(-u)
+    gpos = (torch.log(m) - torch.log(u) - w_dis)[col_of]
+    const = w_dis.sum()
+    prior_none, prior_one = torch.log1p(-q), torch.log(q / kk)
+
+    def votes(eval_X, eval_r, tr_rows):
+        tr_t = torch.as_tensor(tr_rows, device=dev)
+        Htr = Hv[tr_t]
+        rtr = rv[tr_t]
+        slot, valid = slot_all[tr_t], valid_all[tr_t]
+        k2 = int(min(kk, len(tr_rows)))
+        out_c = [[], []]
+        out_t = [[], []]
+        for a in range(0, len(eval_X), 2048):
+            He = onehot(eval_X[a:a + 2048])
+            L = const + (He * gpos[None, :]) @ Htr.T
+            L = L - 1e4 * (eval_r[a:a + 2048, None] == rtr[None, :]).float()
+            top, idx = torch.topk(L, k2, dim=1)
+            z = torch.cat([prior_none.expand(len(He), 1), prior_one + top], dim=1)
+            w = torch.softmax(z, dim=1)[:, 1:]
+            hard = w * (w > 0.5).float()
+            ys = slot[idx]
+            vs = valid[idx].float()
+            for li, ww in enumerate((w, hard)):
+                wv = ww.unsqueeze(2) * vs
+                cnt = torch.zeros((len(He), inst.D), device=dev)
+                cnt.scatter_add_(1, ys.reshape(len(He), -1), wv.reshape(len(He), -1))
+                out_c[li].append(cnt.cpu().numpy())
+                out_t[li].append(wv.sum(1).cpu().numpy())
+        return [np.concatenate(c) for c in out_c], [np.concatenate(t) for t in out_t]
+
+    oof_c = [np.zeros((n, inst.D), np.float32) for _ in range(2)]
+    oof_t = [np.zeros((n, inst.J), np.float32) for _ in range(2)]
+    for fo in range(N_FOLDS):
+        va, tr = np.where(fold == fo)[0], np.where(fold != fo)[0]
+        c, t = votes(Xv[va], rv[torch.as_tensor(va, device=dev)], tr)
+        for li in range(2):
+            oof_c[li][va], oof_t[li][va] = c[li], t[li]
+    hid_c, hid_t = votes(Xh, rh, np.arange(n))
+    mm, uu = m.cpu().numpy(), u.cpu().numpy()
+    info = "%srows with a partner %.3f, agreement on partners %.2f-%.2f, otherwise %.2f-%.2f" % (
+        ("%d respondent columns weak: " % len(wk)) if wk else "", float(q), mm.min(), mm.max(), uu.min(), uu.max())
+    return oof_c, oof_t, hid_c, hid_t, info
 
 
 def _em_batched(L, mask, prior=None, c=0.0, iters=500):
@@ -1257,7 +1399,9 @@ def _stack(inst, oof, test, donors=None):
                 B_oof = (oc[li][ok][:, sl] + alpha * B_oof) / (ot[li][ok][:, j:j + 1] + alpha)
                 B_hid = (hc[li][:, sl] + alpha * B_hid) / (ht[li][:, j:j + 1] + alpha)
                 summary["donor_items"] = summary.get("donor_items", 0) + 1
-                if li >= len(DONOR_CONFIGS):
+                if li >= len(DONOR_CONFIGS) + len(CROSS_CONFIGS):
+                    summary["link_items"] = summary.get("link_items", 0) + 1
+                elif li >= len(DONOR_CONFIGS):
                     summary["cross_items"] = summary.get("cross_items", 0) + 1
         plain = graded(B_oof, yo).sum()
         water = graded(floor_optimal(B_oof), yo).sum()
@@ -1273,8 +1417,8 @@ def _stack(inst, oof, test, donors=None):
         summary["n"] += len(yo)
     if summary["n"]:
         skill = 1 - summary["model_ll"] / summary["marginal_ll"]
-        log("  OOF skill estimate %.4f   donor correction on %d of %d items (%d from the other round)   mean weights: %s" % (
-            skill, summary.get("donor_items", 0), inst.J, summary.get("cross_items", 0),
+        log("  OOF skill estimate %.4f   donor correction on %d of %d items (%d other round, %d linkage)   mean weights: %s" % (
+            skill, summary.get("donor_items", 0), inst.J, summary.get("cross_items", 0), summary.get("link_items", 0),
             ", ".join("%s %.2f" % (k, v) for k, v in weight_report.items() if v > 0.005)))
     return final
 
