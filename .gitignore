@@ -1,0 +1,8 @@
+public/
+_box/
+__pycache__/
+_stress_*.json
+_panel_*.json
+final/
+*.log
+*.zip
